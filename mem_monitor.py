@@ -2,6 +2,16 @@ import os
 import time
 import signal
 import sys
+import argparse
+
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
+from rich.console import Group
+from rich.progress_bar import ProgressBar
+from rich.layout import Layout
 
 # --- CONFIGURATION ---
 CGROUP_PATH = "/sys/fs/cgroup/system.slice/thrashlab.scope"
@@ -12,6 +22,7 @@ CLK_TCK = os.sysconf(os.sysconf_names['SC_CLK_TCK'])
 STREAK_LIMIT = 5
 COOLDOWN_TIME = 10.0
 SWAP_KILL_THRESHOLD = 85
+GRACE_PERIOD = 2.0
 
 
 class ProcessStats:
@@ -73,7 +84,11 @@ def read_psi_total():
 
 
 def main():
-    if os.geteuid() != 0:
+    parser = argparse.ArgumentParser(description="OOMD Simulator")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate kills without sending signals")
+    args = parser.parse_args()
+
+    if os.geteuid() != 0 and not args.dry_run:
         print("ERROR: This monitor must be run with sudo to kill processes.")
         sys.exit(1)
 
@@ -83,6 +98,7 @@ def main():
     thrash_streak = 0
     cooldown_timer = 0.0
     last_kill_msg = ""
+    pending_terms = {}  # {pid: time_sent_sigterm}
 
     try:
         with open(f"{CGROUP_PATH}/memory.swap.max") as f:
@@ -91,13 +107,18 @@ def main():
     except:
         swap_max_mb = 1024
 
-    while True:
-        now = time.time()
-        dt = now - last_time
-        if dt < 1.0:
-            time.sleep(1.0 - dt)
-            now = time.time();
+    console = Console()
+    live = Live(console=console, auto_refresh=False)
+    live.start()
+    
+    try:
+        while True:
+            now = time.time()
             dt = now - last_time
+            if dt < 1.0:
+                time.sleep(1.0 - dt)
+                now = time.time()
+                dt = now - last_time
 
         # 1. Cgroup Memory/Swap Stats
         try:
@@ -134,6 +155,8 @@ def main():
 
         active_list.sort(key=lambda x: x.oom_score, reverse=True)
 
+        pending_terms = {pid: t for pid, t in pending_terms.items() if pid in procs and procs[pid].alive}
+
         # 4. Controller Logic
         oom_status_msg = "HEALTHY"
         should_kill = False
@@ -157,33 +180,89 @@ def main():
         if should_kill and active_list:
             victim = active_list[0]
             try:
-                os.kill(victim.pid, signal.SIGKILL)
-                last_kill_msg = f"KILLED {victim.cmd} (PID {victim.pid}, Final Score {victim.oom_score})"
-                cooldown_timer = COOLDOWN_TIME
-                thrash_streak = 0
+                if args.dry_run:
+                    last_kill_msg = f"WOULD KILL [PID {victim.pid}] {victim.cmd} (Score: {victim.oom_score})"
+                    cooldown_timer = COOLDOWN_TIME
+                    thrash_streak = 0
+                else:
+                    if victim.pid in pending_terms:
+                        if now - pending_terms[victim.pid] >= GRACE_PERIOD:
+                            os.kill(victim.pid, signal.SIGKILL)
+                            last_kill_msg = f"KILLED (SIGKILL) {victim.cmd} (PID {victim.pid})"
+                            cooldown_timer = COOLDOWN_TIME
+                            thrash_streak = 0
+                            del pending_terms[victim.pid]
+                        else:
+                            last_kill_msg = f"WAITING for {victim.cmd} (PID {victim.pid}) grace period..."
+                    else:
+                        os.kill(victim.pid, signal.SIGTERM)
+                        pending_terms[victim.pid] = now
+                        last_kill_msg = f"TERM (SIGTERM) sent to {victim.cmd} (PID {victim.pid})"
             except Exception as e:
                 last_kill_msg = f"ERROR KILLING {victim.pid}: {e}"
+                if victim.pid in pending_terms:
+                    del pending_terms[victim.pid]
 
         # 5. Render
-        os.system("clear")
-        print(f"=== OOMD SIMULATOR ===")
-        print(f"RAM: {m_curr}MB | SWAP: {s_curr}MB ({swap_pct:.1f}%) | PSI: {blocked_ms:.1f}ms/s")
-        print(f"STATUS: {oom_status_msg}")
-        if last_kill_msg: print(f"ACTION: {last_kill_msg}")
-        print("-" * 85)
+        status_color = "green" if oom_status_msg == "HEALTHY" else "bold red"
 
-        # Updated headers to show the math!
-        print(f"{'PID':<7} {'CMD':<8} {'RSS(MB)':<8} {'SWAP(MB)':<9} {'BASE':<6} {'+ ADJ':<6} {'= SCORE':<8} {'CPU%'}")
+        table = Table(expand=True, title="OOMD Simulator Processes")
+        table.add_column("PID", justify="right", style="cyan", no_wrap=True)
+        table.add_column("CMD", style="magenta")
+        table.add_column("RSS(MB)", justify="right", style="green")
+        table.add_column("SWAP(MB)", justify="right", style="red")
+        table.add_column("BASE", justify="right", style="blue")
+        table.add_column("+ ADJ", justify="right", style="yellow")
+        table.add_column("= SCORE", justify="right", style="bold white")
+        table.add_column("CPU%", justify="right", style="green")
+        table.add_column("STATUS", justify="left", style="bold red")
 
         for p in active_list:
             marker = "<- NEXT VICTIM" if p == active_list[0] else ""
+            table.add_row(
+                str(p.pid), p.cmd, str(p.rss), str(p.swap), str(p.base_score),
+                str(p.oom_adj), str(p.oom_score), f"{p.cpu_usage:5.1f}%", marker
+            )
 
-            # Formatted to clearly show BASE + ADJ = SCORE
-            print(
-                f"{p.pid:<7} {p.cmd:<8} {p.rss:<8} {p.swap:<9} {p.base_score:<6} {p.oom_adj:<6} {p.oom_score:<8} {p.cpu_usage:5.1f}% {marker}")
+        info_text = Text()
+        info_text.append(f"RAM: ", style="bold")
+        info_text.append(f"{m_curr}MB ", style="green")
+        info_text.append(f"| SWAP: ", style="bold")
+        info_text.append(f"{s_curr}MB ", style="red")
+        info_text.append(f"| PSI: ", style="bold")
+        info_text.append(f"{blocked_ms:.1f}ms/s\n\n", style="yellow")
+
+        info_text.append(f"STATUS: ", style="bold")
+        info_text.append(f"{oom_status_msg}\n", style=status_color)
+
+        if last_kill_msg:
+            info_text.append(f"ACTION: {last_kill_msg}\n", style="bold blink red")
+
+        swap_bar = ProgressBar(total=100, completed=swap_pct, width=40, style="grey50", complete_style="red")
+        
+        top_layout = Layout()
+        top_layout.split_row(
+            Layout(info_text, name="info"),
+            Layout(Group(Text("SWAP Usage:", style="bold white"), swap_bar, Text(f"{swap_pct:.1f}%", style="red")), name="bar")
+        )
+
+        group = Group(
+            Panel(top_layout, title="System Status", border_style="blue", height=6),
+            table
+        )
+
+        live.update(group)
+        live.refresh()
 
         last_time = now
 
+    except KeyboardInterrupt:
+        live.stop()
+        print("Exiting...")
+        sys.exit(0)
+    except Exception as e:
+        live.stop()
+        raise e
 
 if __name__ == "__main__":
     main()
